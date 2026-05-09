@@ -27,6 +27,7 @@ use cuda_bindings::CUdeviceptr;
 
 use crate::context::CudaContext;
 use crate::error::DriverError;
+use crate::pinned_host_buffer::PinnedHostBuffer;
 use crate::stream::CudaStream;
 
 /// Marker trait for values that can be safely copied between host and device
@@ -223,6 +224,18 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         })
     }
 
+    /// Allocates device memory and copies data from a pinned host buffer.
+    ///
+    /// Pinned host memory allows CUDA to avoid the pageable-memory staging
+    /// path and is required when host-device copies need true asynchronous
+    /// overlap with other stream work.
+    pub fn from_pinned_host(
+        stream: &CudaStream,
+        data: &PinnedHostBuffer<T>,
+    ) -> Result<Self, DriverError> {
+        Self::from_host(stream, data.as_slice())
+    }
+
     /// Allocates zero-initialized device memory of `len` elements, enqueued
     /// on `stream`.
     pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, DriverError> {
@@ -282,5 +295,19 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             )?;
         }
         stream.synchronize()
+    }
+
+    /// Copies the buffer contents into an existing pinned host buffer.
+    ///
+    /// Synchronizes on `stream` before returning. Panics if
+    /// `dst.len() < self.len()`. Use pinned destinations when you need the
+    /// transfer to avoid pageable-memory staging; this helper still waits for
+    /// completion before returning, matching [`Self::copy_to_host`].
+    pub fn copy_to_pinned_host(
+        &self,
+        stream: &CudaStream,
+        dst: &mut PinnedHostBuffer<T>,
+    ) -> Result<(), DriverError> {
+        self.copy_to_host(stream, dst.as_mut_slice())
     }
 }
