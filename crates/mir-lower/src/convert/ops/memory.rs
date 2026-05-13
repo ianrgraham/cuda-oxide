@@ -293,20 +293,10 @@ pub fn convert_shared_alloc_dc(
         (alloc_key, mir_elem_type, size, alignment)
     };
 
-    let global_name = if let Some(key) = &alloc_key {
-        if let Some(existing_name) = shared_globals.get(key) {
-            existing_name.clone()
-        } else {
-            create_shared_global(
-                ctx,
-                op,
-                shared_globals,
-                mir_elem_type,
-                size,
-                alignment,
-                Some(key),
-            )?
-        }
+    let global_name = if alloc_key.is_some()
+        && let Some(existing_name) = shared_globals.get(alloc_key.as_deref().unwrap())
+    {
+        existing_name.clone()
     } else {
         create_shared_global(
             ctx,
@@ -315,7 +305,7 @@ pub fn convert_shared_alloc_dc(
             mir_elem_type,
             size,
             alignment,
-            None,
+            alloc_key,
         )?
     };
 
@@ -343,7 +333,7 @@ fn create_shared_global(
     mir_elem_type: Ptr<TypeObj>,
     size: u64,
     alignment: u64,
-    alloc_key: Option<&String>,
+    alloc_key: Option<String>,
 ) -> Result<pliron::identifier::Identifier> {
     let llvm_elem_type = convert_type(ctx, mir_elem_type).map_err(anyhow_to_pliron)?;
     let array_type = ArrayType::get(ctx, llvm_elem_type, size);
@@ -375,7 +365,7 @@ fn create_shared_global(
     global_op.get_operation().insert_at_front(module_block, ctx);
 
     if let Some(key) = alloc_key {
-        shared_globals.insert(key.clone(), name.clone());
+        shared_globals.insert(key, name.clone());
     }
 
     Ok(name)
