@@ -778,8 +778,8 @@ fn select_target(features: DetectedFeatures) -> &'static str {
 
 /// Generates PTX from LLVM IR using `llc`.
 ///
-/// Tries `llc-22` then `llc-21` in order. LLVM 21+ is the minimum supported
-/// version: earlier `llc` releases reject the modern TMA / tcgen05 / WGMMA
+/// LLVM 21+ is the minimum supported version:
+/// earlier `llc` releases reject the modern TMA / tcgen05 / WGMMA
 /// intrinsic signatures that cuda-oxide emits (e.g. the 10-operand
 /// `llvm.nvvm.cp.async.bulk.tensor.g2s.tile.2d` with `addrspace(7)` + CTA
 /// group parameter requires LLVM 21). If `CUDA_OXIDE_LLC` is set, it is used
@@ -850,6 +850,27 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
         };
     }
 
+    let llc_path = std::process::Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .arg("--print")
+        .arg("host-tuple")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout)
+                    .split('\n')
+                    .zip([["lib", "rustlib"], ["bin", "llc"]])
+                    .flat_map(|(a, b)| [a].into_iter().chain(b))
+                    .collect::<std::path::PathBuf>()
+                    .to_str()
+                    .map(|i| i.to_string())
+            } else {
+                None
+            }
+        });
+
     // Try different llc versions (newest first for best atomics/scope support).
     //
     // LLVM 21 is the floor: older releases reject modern TMA / tcgen05 /
@@ -865,7 +886,12 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
 
     let mut last_error = String::new();
 
-    for (llc_cmd, llc_target) in llc_candidates {
+    for (llc_cmd, llc_target) in llc_path
+        .as_deref()
+        .map(|s| (s, target))
+        .into_iter()
+        .chain(llc_candidates)
+    {
         let result = std::process::Command::new(llc_cmd)
             .arg("-march=nvptx64")
             .arg(format!("-mcpu={}", llc_target))
@@ -894,10 +920,13 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
 
     match last_error.is_empty() {
         true => Err(PipelineError::PtxGeneration(
-            "No working llc-21 or llc-22 found on PATH.\n\
-             cuda-oxide requires LLVM 21+ (earlier versions reject the TMA / \
-             tcgen05 / WGMMA intrinsic signatures we emit).\n\
-             Install with: sudo apt install llvm-21  (or llvm-22)\n\
+            "No working llc found.\n\
+             cuda-oxide tries (in order): CUDA_OXIDE_LLC, the Rust toolchain's \
+             llvm-tools llc, then llc-22 / llc-21 / llc on PATH. \
+             LLVM 21+ is required (earlier versions reject the TMA / tcgen05 / \
+             WGMMA intrinsic signatures we emit).\n\
+             Easiest fix: `rustup component add llvm-tools` (auto-picked up).\n\
+             Alternative: `sudo apt install llvm-21` (or `llvm-22`).\n\
              Or set CUDA_OXIDE_LLC=/path/to/llc to use a specific binary."
                 .to_string(),
         )),
