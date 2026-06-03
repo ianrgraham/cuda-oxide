@@ -151,6 +151,26 @@ pub unsafe fn memcpy_dtod_async(
     unsafe { cuda_bindings::cuMemcpyDtoDAsync_v2(dst, src, num_bytes, stream) }.result()
 }
 
+/// Copies `num_bytes` of device memory **between two contexts** (cross-device P2P),
+/// enqueued on `stream`. `cuMemcpyDtoD` is same-context only; this routes via the
+/// NVLink/PCIe peer path when peer access is enabled (see [`crate::peer`]), falling
+/// back to a staged copy otherwise. Use this for multi-GPU halo exchange.
+///
+/// # Safety
+/// - `dst`/`src` must be valid device pointers in `dst_ctx`/`src_ctx` with at least
+///   `num_bytes` allocated.
+/// - `stream` must be a valid `CUstream`.
+pub unsafe fn memcpy_peer_async(
+    dst: CUdeviceptr,
+    dst_ctx: cuda_bindings::CUcontext,
+    src: CUdeviceptr,
+    src_ctx: cuda_bindings::CUcontext,
+    num_bytes: usize,
+    stream: cuda_bindings::CUstream,
+) -> Result<(), DriverError> {
+    unsafe { cuda_bindings::cuMemcpyPeerAsync(dst, dst_ctx, src, src_ctx, num_bytes, stream) }.result()
+}
+
 /// Sets `num_bytes` of device memory at `dptr` to `value`, enqueued on
 /// `stream`.
 ///
