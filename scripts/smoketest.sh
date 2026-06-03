@@ -359,6 +359,35 @@ run_cargo() {
     fi
 }
 
+# ---- Shared example target dir -------------------------------------------
+#
+# Each example under crates/rustc-codegen-cuda/examples/ is its own standalone
+# cargo workspace (the codegen backend is swapped in via RUSTFLAGS, so they
+# can't live in the root [workspace]). By default every `cargo oxide run`
+# materializes its own target/ and recompiles the whole shared dependency tree
+# (cuda-device, cuda-host, proc-macros, bindgen, ...) from scratch — the
+# dominant cost of this script. Point all example builds at one shared
+# CARGO_TARGET_DIR: cargo fingerprints each unit by package + features +
+# workspace_root + toolchain, so identical deps built with the same pinned
+# nightly + backend RUSTFLAGS compile exactly once and are reused across every
+# example. (Same trick the clippy CI job uses for these workspaces.)
+#
+# The codegen backend .so is built FIRST, with CARGO_TARGET_DIR explicitly
+# cleared, so it lands at its fixed path (crates/rustc-codegen-cuda/target/
+# debug) where cargo-oxide looks for it. A CARGO_TARGET_DIR in scope during
+# that build would redirect the .so into the shared dir and break backend
+# discovery. `cargo oxide setup` is a fast no-op when the backend is current.
+printf "%sBuilding codegen backend (one-time; fast if current)...%s\n" "${C_DIM}" "${C_RESET}"
+if ! env -u CARGO_TARGET_DIR cargo oxide setup >/dev/null 2>&1; then
+    echo "error: failed to build the codegen backend; run 'cargo oxide setup' to see why" >&2
+    exit 2
+fi
+# Honor an externally-set CARGO_TARGET_DIR (e.g. CI); otherwise share one under
+# the repo's target/ so it is gitignored and cleaned by `cargo clean`.
+: "${CARGO_TARGET_DIR:=${repo_root}/target/oxide-examples}"
+export CARGO_TARGET_DIR
+printf "Examples share CARGO_TARGET_DIR=%s\n\n" "${CARGO_TARGET_DIR}"
+
 # ---- Main loop -----------------------------------------------------------
 
 log_dir="${SMOKETEST_LOG_DIR:-.smoketest-logs}"
