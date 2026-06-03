@@ -69,12 +69,20 @@ impl NvvmIrDialect {
     /// Select the NVVM IR dialect for a CUDA target such as `sm_86`,
     /// `sm_100a`, or `compute_120`.
     ///
-    /// Unknown targets default to the modern dialect, preserving existing
-    /// behavior for callers that do their own target validation.
+    /// Only an **explicit** Blackwell-or-newer target (`compute_100+`) gets the
+    /// modern opaque-pointer dialect. Pre-Blackwell targets — **and unknown/`None`
+    /// targets** — get the typed-pointer dialect. This is the safe default for the
+    /// embedded-NVVM-IR → runtime-libNVVM flow (e.g. kernels that pull in libdevice
+    /// and are compiled by `nvvmCompileProgram -gen-lto` on the host GPU): a
+    /// pre-Blackwell libNVVM cannot parse opaque `ptr`, so defaulting unknown
+    /// targets to opaque made those kernels fail to load with
+    /// `nvvmCompileProgram: parse expected type`. Defaulting to typed pointers is
+    /// always loadable on pre-Blackwell and is only "too old" for Blackwell, which
+    /// callers select explicitly.
     pub fn for_target(target: Option<&str>) -> Self {
         match target.and_then(cuda_arch_major) {
-            Some(major) if major < 10 => Self::TypedPointers,
-            _ => Self::OpaquePointers,
+            Some(major) if major >= 10 => Self::OpaquePointers,
+            _ => Self::TypedPointers,
         }
     }
 }
@@ -221,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn nvvm_ir_dialect_selects_opaque_pointers_for_blackwell_and_unknown() {
+    fn nvvm_ir_dialect_selects_opaque_pointers_only_for_explicit_blackwell() {
         assert_eq!(
             NvvmIrDialect::for_target(Some("sm_100")),
             NvvmIrDialect::OpaquePointers
@@ -234,13 +242,18 @@ mod tests {
             NvvmIrDialect::for_target(Some("compute_120")),
             NvvmIrDialect::OpaquePointers
         );
-        assert_eq!(
-            NvvmIrDialect::for_target(None),
-            NvvmIrDialect::OpaquePointers
-        );
+    }
+
+    #[test]
+    fn nvvm_ir_dialect_defaults_unknown_targets_to_typed_pointers() {
+        // Unknown / sentinel / None targets must default to TYPED pointers: the
+        // embedded-IR → runtime-libNVVM flow targets pre-Blackwell GPUs, whose
+        // libNVVM cannot parse opaque `ptr`. (Regression: 3D hex kernels hit the
+        // `nvvm-ir` sentinel and failed with "parse expected type".)
+        assert_eq!(NvvmIrDialect::for_target(None), NvvmIrDialect::TypedPointers);
         assert_eq!(
             NvvmIrDialect::for_target(Some("nvvm-ir")),
-            NvvmIrDialect::OpaquePointers
+            NvvmIrDialect::TypedPointers
         );
     }
 
