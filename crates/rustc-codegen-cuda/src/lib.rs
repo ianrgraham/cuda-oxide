@@ -742,7 +742,11 @@ fn write_device_artifact_object(
     }
 
     let blob = oxide_artifacts::build_artifact_blob(&spec)?;
-    let object = oxide_artifacts::build_host_object_for_target(&blob, host_target)?;
+    // Anchor symbol keyed on the bundle (crate) name — matches the forced
+    // reference the `#[cuda_module]` macro emits from `load()`, so the artifact
+    // object links even from a dependency library crate's rlib.
+    let anchor = reserved_oxide_symbols::artifact_anchor_symbol(&bundle_name);
+    let object = oxide_artifacts::build_host_object_for_target(&blob, host_target, &anchor)?;
     let safe_output_name = sanitize_path_component(output_name);
     let artifact_id = ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let object_dir = output_dir

@@ -221,7 +221,9 @@ mod tests {
             ArtifactPayloadSpec::new(ArtifactPayloadKind::Ptx, "linked.ptx", b"ptx"),
         ))
         .unwrap();
-        let object = build_host_object_for_target(&blob, "x86_64-unknown-linux-gnu").unwrap();
+        let object =
+            build_host_object_for_target(&blob, "x86_64-unknown-linux-gnu", "cuda_oxide_artifact_anchor_246e25db_linked")
+                .unwrap();
         std::fs::write(&source_path, "fn main() {}\n").unwrap();
         std::fs::write(&object_path, object).unwrap();
 

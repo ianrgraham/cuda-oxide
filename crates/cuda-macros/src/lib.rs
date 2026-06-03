@@ -267,6 +267,16 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
         TokenStream2::new()
     };
 
+    // Per-crate artifact-anchor symbol. The codegen backend defines this global
+    // in the embedded device-artifact object; `load_named` below forces a
+    // reference to it so the linker pulls that object's `.oxart` section into the
+    // final executable even when this `#[cuda_module]` lives in a dependency
+    // library crate. Keyed on CARGO_PKG_NAME, exactly as the backend keys the
+    // bundle, so reference and definition stay in lockstep.
+    let anchor_symbol = reserved_oxide_symbols::artifact_anchor_symbol(
+        &std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
+    );
+
     Ok(quote! {
         #(#module_attrs)*
         #vis mod #ident {
@@ -293,6 +303,18 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
                 name: &str,
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
+                // Force the linker to retain this crate's embedded device-artifact
+                // object (its `.oxart` section) even when this module lives in a
+                // dependency library crate — see `anchor_symbol` above. `load_named`
+                // is always reachable from the caller, so the relocation it carries
+                // pulls the artifact object out of the rlib archive.
+                {
+                    unsafe extern "C" {
+                        #[link_name = #anchor_symbol]
+                        static __OXIDE_ARTIFACT_ANCHOR: u8;
+                    }
+                    ::core::hint::black_box(::core::ptr::addr_of!(__OXIDE_ARTIFACT_ANCHOR));
+                }
                 let module = ::cuda_host::load_embedded_module(ctx, name)?;
                 from_module(module).map_err(::cuda_host::EmbeddedModuleError::Driver)
             }

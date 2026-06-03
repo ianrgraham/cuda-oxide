@@ -515,9 +515,10 @@ pub fn read_artifact_bundles_from_object_bytes(
 pub fn build_host_object_for_target(
     section_data: &[u8],
     target: &str,
+    anchor_symbol: &str,
 ) -> Result<Vec<u8>, ArtifactError> {
-    use object::write::Object;
-    use object::{SectionFlags, SectionKind};
+    use object::write::{Object, Symbol, SymbolSection};
+    use object::{SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 
     if section_data.is_empty() {
         return Err(ArtifactError::EmptyPayload);
@@ -535,6 +536,26 @@ pub fn build_host_object_for_target(
     section.flags = SectionFlags::Elf {
         sh_flags: elf::SHF_ALLOC | elf::SHF_GNU_RETAIN,
     };
+
+    // Define a global anchor symbol in the artifact section. The `#[cuda_module]`
+    // macro emits a forced reference to this symbol from the generated `load()`,
+    // making the linker pull this object's `.oxart` section into the final
+    // executable even when the artifact lives in a dependency *library* crate's
+    // rlib. Without it the artifact object is an unreferenced archive member that
+    // the linker drops (SHF_GNU_RETAIN only guards against `--gc-sections`, not
+    // archive-member selection), so the embedded bundle never reaches the binary.
+    if !anchor_symbol.is_empty() {
+        object.add_symbol(Symbol {
+            name: anchor_symbol.as_bytes().to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(section_id),
+            flags: SymbolFlags::None,
+        });
+    }
 
     object
         .write()
@@ -854,7 +875,8 @@ mod tests {
         .unwrap();
 
         for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-            let object = build_host_object_for_target(&blob, target).unwrap();
+            let object =
+                build_host_object_for_target(&blob, target, "cuda_oxide_artifact_anchor_246e25db_demo").unwrap();
             let bundles = read_artifact_bundles_from_object_bytes(&object).unwrap();
             assert_eq!(bundles.len(), 1);
             assert_eq!(
@@ -871,7 +893,7 @@ mod tests {
 
         for target in ["powerpc64le-unknown-linux-gnu", "x86_64-apple-darwin"] {
             assert!(matches!(
-                build_host_object_for_target(&blob, target),
+                build_host_object_for_target(&blob, target, "anchor"),
                 Err(ArtifactError::UnsupportedHostTarget(_))
             ));
         }

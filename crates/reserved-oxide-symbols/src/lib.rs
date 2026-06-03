@@ -104,6 +104,18 @@ pub const INSTANTIATE_PREFIX: &str = "cuda_oxide_instantiate_246e25db_";
 /// hidden thread-index scope token.
 pub const KERNEL_SCOPE_LOCAL: &str = "cuda_oxide_kernel_scope_246e25db";
 
+/// Prefix for the per-crate **artifact anchor** symbol.
+///
+/// The codegen backend defines a global symbol with this prefix in the
+/// embedded device-artifact object, and the `#[cuda_module]` macro emits a
+/// forced reference to it from the generated `load()`. The reference makes the
+/// linker pull the artifact object's `.oxart` section into the final
+/// executable **even when the `#[cuda_module]` lives in a dependency library
+/// crate** — without it, the artifact object is an unreferenced archive member
+/// that the linker drops, so the embedded bundle never reaches the binary and
+/// `load_embedded_module` fails with "module not found".
+pub const ARTIFACT_ANCHOR_PREFIX: &str = "cuda_oxide_artifact_anchor_246e25db_";
+
 // ============================================================================
 // Layer 2 — builders (macro side)
 // ============================================================================
@@ -152,6 +164,29 @@ pub fn device_extern_symbol(base: &str) -> String {
 /// ```
 pub fn instantiate_symbol(base: &str) -> String {
     format!("{INSTANTIATE_PREFIX}{base}")
+}
+
+/// Build the per-crate artifact-anchor symbol from a bundle (crate) name.
+///
+/// The bundle name is sanitized to a valid symbol tail (every char outside
+/// `[A-Za-z0-9_]` becomes `_`), so package names with hyphens (e.g.
+/// `gale-gpu`) yield a valid symbol. The macro and the codegen backend both
+/// call this with `CARGO_PKG_NAME`, keeping the reference and the definition
+/// in lockstep.
+///
+/// ```
+/// use reserved_oxide_symbols::artifact_anchor_symbol;
+/// assert_eq!(
+///     artifact_anchor_symbol("gale-gpu"),
+///     "cuda_oxide_artifact_anchor_246e25db_gale_gpu",
+/// );
+/// ```
+pub fn artifact_anchor_symbol(bundle: &str) -> String {
+    let mut s = String::from(ARTIFACT_ANCHOR_PREFIX);
+    for ch in bundle.chars() {
+        s.push(if ch.is_ascii_alphanumeric() || ch == '_' { ch } else { '_' });
+    }
+    s
 }
 
 // ============================================================================
