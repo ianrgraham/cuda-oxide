@@ -1285,14 +1285,20 @@ impl<'a> ModuleExportState<'a> {
         let agg = op_ref.get_operand(0);
         let val = op_ref.get_operand(1);
 
+        // The inserted value's printed type is the field type (in typed-pointer mode
+        // every PointerType prints as `i8*`), but a pointer *value* may have been
+        // SSA-defined with a concrete pointee type (e.g. a GEP result `double*`).
+        // Using it directly is illegal in typed-pointer mode, so coerce with a
+        // bitcast first — the cast must be emitted before the insertvalue line.
+        let mut valtype = String::new();
+        self.export_type(val.get_type(self.ctx), &mut valtype)?;
+        let val_name = self.coerce_pointer_value(val, &valtype, value_names, output)?;
+
         write!(output, "  {res_name} = insertvalue ").unwrap();
         self.export_type(agg.get_type(self.ctx), output)?;
         write!(output, " ").unwrap();
         self.export_value(agg, value_names, output)?;
-        write!(output, ", ").unwrap();
-        self.export_type(val.get_type(self.ctx), output)?;
-        write!(output, " ").unwrap();
-        self.export_value(val, value_names, output)?;
+        write!(output, ", {valtype} {val_name}").unwrap();
         for idx in op.indices(self.ctx) {
             write!(output, ", {idx}").unwrap();
         }
@@ -1478,6 +1484,46 @@ impl<'a> ModuleExportState<'a> {
         writeln!(
             output,
             "  {cast_name} = {cast_op} {current_type} {ptr_name} to {desired_type}"
+        )
+        .unwrap();
+        Ok(cast_name)
+    }
+
+    /// Coerce a pointer *value* used as an aggregate/argument/return operand to a
+    /// declared `target_type` string. In typed-pointer mode a pointer value may have
+    /// been SSA-defined with a concrete pointee (e.g. a GEP `double*`) while the
+    /// consuming slot is declared `i8*`; emit a `bitcast` to reconcile. Non-pointer
+    /// values and the opaque-pointer dialect are returned unchanged. The pointee
+    /// differs but the address space is shared, so a plain `bitcast` is correct.
+    fn coerce_pointer_value(
+        &mut self,
+        val: Value,
+        target_type: &str,
+        value_names: &HashMap<Value, String>,
+        output: &mut String,
+    ) -> Result<String, String> {
+        let mut name = String::new();
+        self.export_value(val, value_names, &mut name)?;
+
+        if self.nvvm_ir_dialect != Some(NvvmIrDialect::TypedPointers) {
+            return Ok(name);
+        }
+        if !val
+            .get_type(self.ctx)
+            .deref(self.ctx)
+            .is::<crate::types::PointerType>()
+        {
+            return Ok(name);
+        }
+        let current_type = self.pointer_value_type(val)?;
+        if current_type == target_type {
+            return Ok(name);
+        }
+        let cast_name = format!("%ptrcast{}", self.next_pointer_cast_id);
+        self.next_pointer_cast_id += 1;
+        writeln!(
+            output,
+            "  {cast_name} = bitcast {current_type} {name} to {target_type}"
         )
         .unwrap();
         Ok(cast_name)

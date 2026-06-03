@@ -7,10 +7,10 @@ use dialect_llvm::{
     export::{NvvmExportConfig, export_module_to_string, export_module_with_externs},
     op_interfaces::CastOpInterface,
     ops::{
-        AddressOfOp, BitcastOp, BrOp, CallOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp, LoadOp,
-        ReturnOp,
+        AddressOfOp, BitcastOp, BrOp, CallOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp,
+        InsertValueOp, LoadOp, ReturnOp, UndefOp,
     },
-    types::{FuncType, PointerType, VoidType},
+    types::{FuncType, PointerType, StructType, VoidType},
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -282,6 +282,64 @@ fn typed_nvvm_export_pretypes_late_gep_pointer_uses() {
     assert!(
         !ir.contains("bitcast i8 addrspace(3)* %v2 to i32 addrspace(3)*"),
         "typed NVVM should not repair a pretyped GEP result from erased i8*:\n{ir}"
+    );
+}
+
+#[test]
+fn typed_nvvm_export_casts_typed_pointer_before_insertvalue() {
+    // Regression: inserting a concretely-typed pointer value (a GEP result `i32*`)
+    // into a struct whose field prints as the erased `i8*` must emit a repair
+    // `bitcast` BEFORE the insertvalue. Without it libNVVM rejects the module with
+    // "parse '%vN' defined with type 'i32*'" in typed-pointer mode.
+    let mut ctx = Context::new();
+    dialect_llvm::register(&mut ctx);
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+
+    let void_ty = VoidType::get(&mut ctx);
+    let i8_ty = IntegerType::get(&mut ctx, 8, Signedness::Signless);
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let ptr_ty = PointerType::get_generic(&mut ctx);
+    let struct_ty = StructType::get_unnamed(&mut ctx, vec![i8_ty.into(), ptr_ty.into()]);
+
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![ptr_ty.into()], false);
+    let func = FuncOp::new(&mut ctx, "insert_typed_ptr".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let ptr_arg = entry.deref(&ctx).arguments().next().unwrap();
+
+    // GEP produces a concretely-typed `i32*`.
+    let gep = GetElementPtrOp::new(&mut ctx, ptr_arg, vec![GepIndex::Constant(0)], i32_ty.to_ptr())
+        .expect("valid GEP");
+    let gep_val = gep.get_operation().deref(&ctx).get_result(0);
+    gep.get_operation().insert_at_back(entry, &ctx);
+
+    // Insert it into field 1 (an erased `i8*`) of an undef struct.
+    let undef = UndefOp::new(&mut ctx, struct_ty.into());
+    let undef_val = undef.get_operation().deref(&ctx).get_result(0);
+    undef.get_operation().insert_at_back(entry, &ctx);
+    let iv = InsertValueOp::new(&mut ctx, undef_val, gep_val, vec![1]);
+    iv.get_operation().insert_at_back(entry, &ctx);
+
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = NvvmExportConfig::for_target(Some("sm_86"));
+    let ir = export_module_with_externs::<dialect_llvm::export::DeviceExternDecl>(
+        &ctx, &module, &[], &config,
+    )
+    .expect("export succeeds");
+
+    assert!(
+        ir.contains("= bitcast i32* ") && ir.contains(" to i8*"),
+        "insertvalue of a typed pointer needs a repair bitcast to the field type:\n{ir}"
+    );
+    assert!(
+        ir.contains("insertvalue") && ir.contains("i8* %ptrcast"),
+        "insertvalue must consume the repaired (bitcast) pointer, not the raw i32*:\n{ir}"
     );
 }
 
