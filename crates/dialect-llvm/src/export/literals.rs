@@ -13,7 +13,15 @@ pub(super) fn format_half_literal(bits: u16) -> String {
 /// LLVM requires float literals to have a decimal point (e.g., "0.0" not "0").
 pub(super) fn format_float_literal(value: f64) -> String {
     if value.is_nan() {
-        "nan".to_string()
+        // libNVVM's NVVM-IR text parser rejects the bare `nan` keyword ("parse
+        // expected value token"), so emit the IEEE-754 hex form like ±inf below.
+        // Sign-aware, canonical quiet-NaN payload (0x…8…). This unblocks any device
+        // code producing NaN constants — e.g. `f64::signum` (NaN-check + copysign).
+        if value.is_sign_positive() {
+            "0x7FF8000000000000".to_string()
+        } else {
+            "0xFFF8000000000000".to_string()
+        }
     } else if value.is_infinite() {
         if value.is_sign_positive() {
             "0x7FF0000000000000".to_string() // +inf
