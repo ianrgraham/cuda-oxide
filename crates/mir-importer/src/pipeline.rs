@@ -384,6 +384,11 @@ pub fn run_pipeline(
         let mode = if emit_nvvm_ir { "NVVM IR" } else { "PTX" };
         eprintln!("\n=== Exporting to LLVM IR ({} mode) ===", mode);
     }
+    // Ensure the artifact output dir exists. This matters when it is redirected
+    // (e.g. CUDA_OXIDE_PTX_DIR=target/cuda-artifacts) to a path that may not have
+    // been created yet — std::fs::write does not create parent dirs.
+    std::fs::create_dir_all(&config.output_dir)
+        .map_err(|e| PipelineError::Export(e.to_string()))?;
     let ll_path = config.output_dir.join(format!("{}.ll", config.output_name));
     let target_override = std::env::var("CUDA_OXIDE_TARGET").ok();
     let _llvm_ir = export_llvm_ir(
