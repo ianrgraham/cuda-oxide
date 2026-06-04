@@ -189,6 +189,36 @@ enum RustFloatMathIntrinsic {
     Fabs,
     CopysignF32,
     CopysignF64,
+    // libm functions reached via `std::sys::cmath` (extern "C"), not `core::intrinsics`.
+    // Matched by bare symbol name in `from_libm_symbol`, mapped to `__nv_*` libdevice.
+    Atan2F32,
+    Atan2F64,
+    AtanF32,
+    AtanF64,
+    AsinF32,
+    AsinF64,
+    AcosF32,
+    AcosF64,
+    SinhF32,
+    SinhF64,
+    CoshF32,
+    CoshF64,
+    TanhF32,
+    TanhF64,
+    AsinhF32,
+    AsinhF64,
+    AcoshF32,
+    AcoshF64,
+    AtanhF32,
+    AtanhF64,
+    CbrtF32,
+    CbrtF64,
+    HypotF32,
+    HypotF64,
+    Expm1F32,
+    Expm1F64,
+    Log1pF32,
+    Log1pF64,
 }
 
 impl RustFloatMathIntrinsic {
@@ -238,6 +268,55 @@ impl RustFloatMathIntrinsic {
         }
     }
 
+    /// Match a bare **libm** symbol name (the extern "C" functions `std::sys::cmath`
+    /// routes `f64`/`f32` methods through — `atan2`, `atan`, `asin`, `acos`, `sinh`,
+    /// `cosh`, `tanh`, `cbrt`, `hypot`, …). These are NOT `core::intrinsics`, so they
+    /// arrive as ordinary external calls; we redirect them to the corresponding
+    /// `__nv_*` libdevice function (the same lowering path as `exp`/`sin`/`sqrt`).
+    /// The `f` suffix is the f32 variant.
+    fn from_libm_symbol(callee: &str) -> Option<Self> {
+        // Float math reaches us via two routes, both redirected to libdevice here:
+        //  - `std::sys::cmath::<fn>` → legalized `std__sys__cmath__<fn>` (extern "C" libm
+        //    wrappers: atan2, atan, asin, acos, sinh, cosh, tanh, hypot, …);
+        //  - `core_float_math` (unstable) → bundled pure-Rust libm,
+        //    `core__num__imp__libm__<fn>` (e.g. `cbrt`).
+        // Strip either module prefix to recover the bare function name; also accept the
+        // bare extern "C" symbol if it ever appears directly.
+        let name = callee.rsplit("cmath__").next().unwrap_or(callee);
+        let name = name.rsplit("libm__").next().unwrap_or(name);
+        match name {
+            "atan2" => Some(Self::Atan2F64),
+            "atan2f" => Some(Self::Atan2F32),
+            "atan" => Some(Self::AtanF64),
+            "atanf" => Some(Self::AtanF32),
+            "asin" => Some(Self::AsinF64),
+            "asinf" => Some(Self::AsinF32),
+            "acos" => Some(Self::AcosF64),
+            "acosf" => Some(Self::AcosF32),
+            "sinh" => Some(Self::SinhF64),
+            "sinhf" => Some(Self::SinhF32),
+            "cosh" => Some(Self::CoshF64),
+            "coshf" => Some(Self::CoshF32),
+            "tanh" => Some(Self::TanhF64),
+            "tanhf" => Some(Self::TanhF32),
+            "asinh" => Some(Self::AsinhF64),
+            "asinhf" => Some(Self::AsinhF32),
+            "acosh" => Some(Self::AcoshF64),
+            "acoshf" => Some(Self::AcoshF32),
+            "atanh" => Some(Self::AtanhF64),
+            "atanhf" => Some(Self::AtanhF32),
+            "cbrt" => Some(Self::CbrtF64),
+            "cbrtf" => Some(Self::CbrtF32),
+            "hypot" => Some(Self::HypotF64),
+            "hypotf" => Some(Self::HypotF32),
+            "expm1" => Some(Self::Expm1F64),
+            "expm1f" => Some(Self::Expm1F32),
+            "log1p" => Some(Self::Log1pF64),
+            "log1pf" => Some(Self::Log1pF32),
+            _ => None,
+        }
+    }
+
     /// CUDA libdevice function name for this Rust math intrinsic.
     fn libdevice_name(
         self,
@@ -283,6 +362,34 @@ impl RustFloatMathIntrinsic {
             Self::Fabs => fabs_libdevice_name(ctx, result_ty, loc),
             Self::CopysignF32 => Ok("__nv_copysignf"),
             Self::CopysignF64 => Ok("__nv_copysign"),
+            Self::Atan2F32 => Ok("__nv_atan2f"),
+            Self::Atan2F64 => Ok("__nv_atan2"),
+            Self::AtanF32 => Ok("__nv_atanf"),
+            Self::AtanF64 => Ok("__nv_atan"),
+            Self::AsinF32 => Ok("__nv_asinf"),
+            Self::AsinF64 => Ok("__nv_asin"),
+            Self::AcosF32 => Ok("__nv_acosf"),
+            Self::AcosF64 => Ok("__nv_acos"),
+            Self::SinhF32 => Ok("__nv_sinhf"),
+            Self::SinhF64 => Ok("__nv_sinh"),
+            Self::CoshF32 => Ok("__nv_coshf"),
+            Self::CoshF64 => Ok("__nv_cosh"),
+            Self::TanhF32 => Ok("__nv_tanhf"),
+            Self::TanhF64 => Ok("__nv_tanh"),
+            Self::AsinhF32 => Ok("__nv_asinhf"),
+            Self::AsinhF64 => Ok("__nv_asinh"),
+            Self::AcoshF32 => Ok("__nv_acoshf"),
+            Self::AcoshF64 => Ok("__nv_acosh"),
+            Self::AtanhF32 => Ok("__nv_atanhf"),
+            Self::AtanhF64 => Ok("__nv_atanh"),
+            Self::CbrtF32 => Ok("__nv_cbrtf"),
+            Self::CbrtF64 => Ok("__nv_cbrt"),
+            Self::HypotF32 => Ok("__nv_hypotf"),
+            Self::HypotF64 => Ok("__nv_hypot"),
+            Self::Expm1F32 => Ok("__nv_expm1f"),
+            Self::Expm1F64 => Ok("__nv_expm1"),
+            Self::Log1pF32 => Ok("__nv_log1pf"),
+            Self::Log1pF64 => Ok("__nv_log1p"),
         }
     }
 
@@ -294,7 +401,11 @@ impl RustFloatMathIntrinsic {
             | Self::PowfF32
             | Self::PowfF64
             | Self::CopysignF32
-            | Self::CopysignF64 => 2,
+            | Self::CopysignF64
+            | Self::Atan2F32
+            | Self::Atan2F64
+            | Self::HypotF32
+            | Self::HypotF64 => 2,
             Self::FmaF32 | Self::FmaF64 | Self::FmuladdF32 | Self::FmuladdF64 => 3,
             _ => 1,
         }
@@ -346,6 +457,13 @@ pub fn convert(
     }
 
     if let Some(intrinsic) = RustFloatMathIntrinsic::from_placeholder_callee(&callee_name) {
+        return convert_rust_float_math_intrinsic(ctx, rewriter, op, intrinsic);
+    }
+
+    // libm extern "C" math symbols (atan2/atan/asin/acos/sinh/cosh/tanh/cbrt/hypot/…)
+    // that `std::sys::cmath` routes f64/f32 methods through — redirect to `__nv_*`
+    // libdevice, the same path the `core::intrinsics` math functions take above.
+    if let Some(intrinsic) = RustFloatMathIntrinsic::from_libm_symbol(&callee_name) {
         return convert_rust_float_math_intrinsic(ctx, rewriter, op, intrinsic);
     }
 

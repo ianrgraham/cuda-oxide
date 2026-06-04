@@ -1013,6 +1013,18 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Forbidden crate: std (OS, I/O, threads) - absolutely can't run on GPU
         if name_str == "std" {
             let fn_path = self.tcx.def_path_str(def_id);
+            // EXCEPTION: `std::sys::cmath::*` are the libm float bindings (atan2, atan,
+            // asin, acos, sinh, cosh, tanh, cbrt, hypot, expm1, log1p, ...) that the
+            // `f64`/`f32` methods route through. Unlike sqrt/sin/exp (which are
+            // `core::intrinsics` and lowered to `__nv_*` directly), these are extern
+            // "C" libm calls. We don't compile the std wrapper (it inlines to the
+            // extern symbol); the bare libm symbol is then redirected to the
+            // corresponding `__nv_*` libdevice function during MIR lowering
+            // (see mir-lower call.rs `from_libm_symbol`). Skipping here avoids the
+            // std-forbidden panic so device code can use inverse-trig / hyperbolic math.
+            if fn_path.contains("sys::cmath") {
+                return CollectDecision::SkipIntentional;
+            }
             return CollectDecision::Forbidden {
                 crate_name: name_str.to_string(),
                 fn_path,
