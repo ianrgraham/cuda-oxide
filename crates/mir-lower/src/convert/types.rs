@@ -86,7 +86,7 @@
 //!
 //! This matches the C ABI for GPU kernels.
 
-use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
+use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType, MirTupleType};
 use llvm_export::types as llvm_types;
 use llvm_export::types::PointerTypeExt;
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -363,84 +363,175 @@ pub fn convert_function_type(
     Ok(llvm_types::FuncType::get(ctx, ret_ty, inputs, false))
 }
 
-/// Build an LLVM struct with explicit padding to match rustc's exact layout.
+// =============================================================================
+// Struct Slot Mapping (single source of truth, issue #128)
+// =============================================================================
+
+/// Declaration-order layout facts for one MIR aggregate, in the exact form
+/// [`build_struct_slot_map`] consumes.
 ///
-/// This ensures perfect ABI compatibility between host and device by using
-/// padding arrays `[N x i8]` to place fields at their exact offsets.
+/// Extracting this owned carrier first (and dropping the `Ref` returned by
+/// `Ptr::deref`) keeps the borrow checker happy: the slot-map build needs
+/// `&mut Context` for type interning.
+pub(crate) struct StructLayoutInfo {
+    /// Field types in declaration order.
+    pub field_types: Vec<Ptr<TypeObj>>,
+    /// Memory order: `mem_to_decl[mem_idx] = decl_idx`. Always full length
+    /// (identity when rustc did not reorder).
+    pub mem_to_decl: Vec<usize>,
+    /// Byte offset of each field in declaration order; empty when rustc
+    /// layout is unknown.
+    pub field_offsets: Vec<u64>,
+    /// Total size in bytes including trailing padding; 0 when unknown.
+    pub total_size: u64,
+}
+
+impl StructLayoutInfo {
+    /// Layout facts of a `MirStructType`.
+    pub(crate) fn of_struct(s: &MirStructType) -> Self {
+        StructLayoutInfo {
+            field_types: s.field_types.clone(),
+            mem_to_decl: s.memory_order(),
+            field_offsets: s.field_offsets().to_vec(),
+            total_size: s.total_size(),
+        }
+    }
+
+    /// Layout facts of a `MirTupleType`: identity order, no rustc layout.
+    pub(crate) fn of_tuple(t: &MirTupleType) -> Self {
+        let field_types = t.get_types().to_vec();
+        let mem_to_decl = (0..field_types.len()).collect();
+        StructLayoutInfo {
+            field_types,
+            mem_to_decl,
+            field_offsets: vec![],
+            total_size: 0,
+        }
+    }
+}
+
+/// One lowered LLVM struct plus the value-level slot mapping into it.
 ///
-/// # Why This Matters
+/// [`build_struct_slot_map`] produces the struct type and the index map in
+/// the same walk, so every op that indexes into the struct (`insertvalue`,
+/// `extractvalue`, GEP, call-boundary flatten/reconstruct) shares the type
+/// converter's view of where each field landed. Computing the indices
+/// separately is how the issue #128 class of bug (indices that ignore the
+/// `[N x i8]` padding slots) happened.
+pub(crate) struct StructSlotMap {
+    /// The final LLVM struct type, including any `[N x i8]` padding slots.
+    pub llvm_struct_ty: Ptr<TypeObj>,
+    /// `decl_to_llvm[decl_idx]` = LLVM slot of that declaration-order field;
+    /// `None` when the field is zero-sized and was stripped.
+    pub decl_to_llvm: Vec<Option<u32>>,
+    /// Converted LLVM type of each declaration-order field (ZSTs included).
+    pub field_llvm_types: Vec<Ptr<TypeObj>>,
+}
+
+/// Lower a struct/tuple layout to its LLVM struct type and slot map.
 ///
-/// LLVM's datalayout string controls how it computes struct field offsets.
-/// If the host uses different alignment rules than our datalayout, the struct
-/// layout would differ. By using explicit padding, we match rustc's layout
-/// exactly, regardless of LLVM's datalayout.
+/// When rustc layout is present (`field_offsets` non-empty and
+/// `total_size > 0`), fields are placed at their exact byte offsets with
+/// explicit `[N x i8]` padding slots in between, plus a trailing pad up to
+/// `total_size`. This makes the layout independent of LLVM's datalayout
+/// and so ABI-identical to what rustc computed on the host. For
+/// `struct Extreme { a: u8, b: i128 }` where rustc puts `b` at offset 0
+/// and `a` at offset 16 with total size 32, we build:
 ///
-/// # Example
-///
-/// For `struct Extreme { a: u8, b: i128 }` where rustc computes:
-/// - field `b` at offset 0 (16 bytes)
-/// - field `a` at offset 16 (1 byte)
-/// - total size: 32 bytes (aligned to 16)
-///
-/// We generate:
 /// ```text
-/// { i128, i8, [15 x i8] }  ; b at 0, a at 16, padding to 32
+/// { i128, i8, [15 x i8] }   ; slots:  b = 0, a = 1, pad = 2
 /// ```
 ///
-/// # Arguments
+/// Without rustc layout, fields are emitted in memory order with no
+/// padding. On both paths zero-sized fields (e.g. `PhantomData`) are
+/// stripped, because NVPTX rejects empty types; stripped fields get
+/// `None` in `decl_to_llvm`.
 ///
-/// * `ctx` - The pliron context
-/// * `field_types` - Field types in declaration order
-/// * `mem_to_decl` - Memory order: mem_to_decl[mem_idx] = decl_idx
-/// * `field_offsets` - Byte offset of each field in declaration order
-/// * `total_size` - Total struct size in bytes
-pub(crate) fn build_struct_with_explicit_padding(
+/// Malformed layout metadata (a `mem_to_decl` that is not a permutation,
+/// or an offsets vector of the wrong length) is rejected loudly: guessing
+/// here would scramble every downstream field access.
+pub(crate) fn build_struct_slot_map(
     ctx: &mut Context,
-    field_types: &[Ptr<TypeObj>],
-    mem_to_decl: &[usize],
-    field_offsets: &[u64],
-    total_size: u64,
-) -> Result<Ptr<TypeObj>, anyhow::Error> {
+    layout: &StructLayoutInfo,
+) -> Result<StructSlotMap, anyhow::Error> {
+    let num_fields = layout.field_types.len();
+
+    if layout.mem_to_decl.len() != num_fields {
+        return Err(anyhow::anyhow!(
+            "struct slot map: memory order has {} entries but the struct has {} fields",
+            layout.mem_to_decl.len(),
+            num_fields
+        ));
+    }
+    let mut seen = vec![false; num_fields];
+    for &decl_idx in &layout.mem_to_decl {
+        if decl_idx >= num_fields || seen[decl_idx] {
+            return Err(anyhow::anyhow!(
+                "struct slot map: memory order {:?} is not a permutation of 0..{}",
+                layout.mem_to_decl,
+                num_fields
+            ));
+        }
+        seen[decl_idx] = true;
+    }
+    let has_explicit_layout = !layout.field_offsets.is_empty() && layout.total_size > 0;
+    if has_explicit_layout && layout.field_offsets.len() != num_fields {
+        return Err(anyhow::anyhow!(
+            "struct slot map: {} field offsets for {} fields",
+            layout.field_offsets.len(),
+            num_fields
+        ));
+    }
+
+    // Convert every field up front, in declaration order.
+    let mut field_llvm_types = Vec::with_capacity(num_fields);
+    for &field_ty in &layout.field_types {
+        field_llvm_types.push(convert_type(ctx, field_ty)?);
+    }
+
     let mut llvm_fields: Vec<Ptr<TypeObj>> = Vec::new();
+    let mut decl_to_llvm: Vec<Option<u32>> = vec![None; num_fields];
     let mut current_offset: u64 = 0;
 
-    // Process fields in memory order
-    for mem_idx in 0..field_types.len() {
-        let decl_idx = mem_to_decl[mem_idx];
-        let field_ty = field_types[decl_idx];
-        let target_offset = field_offsets[decl_idx];
+    // Place fields in memory order.
+    for &decl_idx in &layout.mem_to_decl {
+        let llvm_ty = field_llvm_types[decl_idx];
 
-        // Insert padding if needed to reach the target offset
-        if current_offset < target_offset {
-            let padding_size = target_offset - current_offset;
-            let padding_ty = make_padding_type(ctx, padding_size);
-            llvm_fields.push(padding_ty);
-            current_offset = target_offset;
-        }
-
-        // Convert and add the field
-        let llvm_ty = convert_type(ctx, field_ty)?;
-
-        // Skip ZST fields (PhantomData) - they have no size
+        // ZST fields are stripped: no slot, no offset advance (rustc gives
+        // them size 0).
         if is_zero_sized_type(ctx, llvm_ty) {
             continue;
         }
 
+        if has_explicit_layout {
+            // Insert padding if needed to reach the rustc field offset.
+            let target_offset = layout.field_offsets[decl_idx];
+            if current_offset < target_offset {
+                let padding_ty = make_padding_type(ctx, target_offset - current_offset);
+                llvm_fields.push(padding_ty);
+                current_offset = target_offset;
+            }
+        }
+
+        decl_to_llvm[decl_idx] = Some(llvm_fields.len() as u32);
         llvm_fields.push(llvm_ty);
 
-        // Advance offset by field size
-        let field_size = get_type_size(ctx, llvm_ty);
-        current_offset += field_size;
+        if has_explicit_layout {
+            current_offset += get_type_size(ctx, llvm_ty);
+        }
     }
 
-    // Add trailing padding to reach total_size
-    if current_offset < total_size {
-        let trailing_padding = total_size - current_offset;
-        let padding_ty = make_padding_type(ctx, trailing_padding);
+    // Add trailing padding to reach total_size.
+    if has_explicit_layout && current_offset < layout.total_size {
+        let padding_ty = make_padding_type(ctx, layout.total_size - current_offset);
         llvm_fields.push(padding_ty);
     }
 
-    Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
+    Ok(StructSlotMap {
+        llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, llvm_fields).into(),
+        decl_to_llvm,
+        field_llvm_types,
+    })
 }
 
 /// Create a padding type: `[N x i8]` for N bytes of padding.
